@@ -2,11 +2,11 @@
 
 // ═══════════════════════════════════════════════════
 //  Claude Code Patcher
-//  Model output limits · Max effort unlock
+//  Model output limits · Max effort · Fast mode
 //  macOS · Linux · Windows · Node 18+
 //
 //  node claude-code-patch.mjs          Interactive
-//  node claude-code-patch.mjs --auto   Effort only
+//  node claude-code-patch.mjs --auto   Effort + fast mode
 //  node claude-code-patch.mjs --undo   Restore
 // ═══════════════════════════════════════════════════
 
@@ -160,6 +160,16 @@ function analyze(src) {
       needsPatch: /==="medium"\?\[\w,\w\]:\[\w,\w\]/.test(src) && !/label:"Use max effort"/.test(src),
       patched: /label:"Use max effort"/.test(src),
     },
+    // Fast mode: native binary gate (T9 check before "requires the native binary")
+    fastModeNative: {
+      locked: /&&!\w+\(\)\)return"Fast mode requires the native binary/.test(src),
+      unlocked: /&&false\)return"Fast mode requires the native binary/.test(src),
+    },
+    // Fast mode: org preference gate (HT6 check with "oauth"/"api-key" leading to y_z)
+    fastModeOrg: {
+      locked: /if\((?!false\b)\w+\)\{let \w+=\w+\(\)!==null\?"oauth":"api-key"/.test(src),
+      unlocked: /if\(false\)\{let \w+=\w+\(\)!==null\?"oauth":"api-key"/.test(src),
+    },
   };
 }
 
@@ -217,6 +227,24 @@ function patchEffortChooser(src) {
   const mx = `{label:"Use max effort",description:"Maximum reasoning depth. Highest token cost.",value:"max"}`;
   const rep = `${j}=${J}==="medium"?[${H},${O},${mx}]:${J}==="max"?[${mx},${O},${H}]:[${O},${H},${mx}]`;
   return src.slice(0, m.index) + rep + src.slice(m.index + m[0].length);
+}
+
+function patchFastModeNative(src) {
+  // Bypass: &&!T9())return"Fast mode requires the native binary"
+  // Replace the !FUNCNAME() with false, keeping everything else intact.
+  return src.replace(
+    /(&&)!\w+\(\)(\)return"Fast mode requires the native binary)/,
+    "$1false$2"
+  );
+}
+
+function patchFastModeOrg(src) {
+  // Bypass: if(HT6){let q=M4()!==null?"oauth":"api-key",K=y_z(HT6,q);...}
+  // Replace if(VAR) with if(false) so the org-disabled branch is never taken.
+  return src.replace(
+    /if\(\w+\)(\{let \w+=\w+\(\)!==null\?"oauth":"api-key")/,
+    "if(false)$1"
+  );
 }
 
 // ── TUI: multi-select ────────────────────────────
@@ -331,7 +359,7 @@ function banner() {
   console.log();
   console.log(`  ${dim("┌" + "─".repeat(40) + "┐")}`);
   console.log(`  ${dim("│")}  ${bold("⚡ Claude Code Patcher")}${" ".repeat(17)}${dim("│")}`);
-  console.log(`  ${dim("│")}  ${dim("Output limits · Max effort · Universal")} ${dim("│")}`);
+  console.log(`  ${dim("│")}  ${dim("Limits · Effort · Fast mode · Universal")} ${dim("│")}`);
   console.log(`  ${dim("└" + "─".repeat(40) + "┘")}`);
   console.log();
 }
@@ -390,16 +418,25 @@ async function main() {
   const needsChooser = state.effortChooser.needsPatch;
   const effortFullyPatched = state.effortGate.unlocked && state.effortLevels.patched && state.effortChooser.patched;
 
+  // ── Fast mode status ──
+  const needsFastNative = state.fastModeNative.locked;
+  const needsFastOrg = state.fastModeOrg.locked;
+  const fastFullyPatched = state.fastModeNative.unlocked && state.fastModeOrg.unlocked;
+  const fastNeedsAny = needsFastNative || needsFastOrg;
+
   // ── Collect what to do ──
   let selectedModels = [];
   let newLimit = 0;
   let doEffort = false;
+  let doFastMode = false;
 
   if (isAuto) {
-    // Auto: effort patches only, no model assumptions
+    // Auto: effort + fast mode patches, no model assumptions
     doEffort = !effortFullyPatched;
-    if (!doEffort) { ok("All effort patches already applied. Nothing to do.\n"); return; }
-    info("Auto: applying all effort patches");
+    doFastMode = !fastFullyPatched && fastNeedsAny;
+    if (!doEffort && !doFastMode) { ok("All patches already applied. Nothing to do.\n"); return; }
+    if (doEffort) info("Auto: applying effort patches");
+    if (doFastMode) info("Auto: applying fast mode patches");
   } else {
     // ── Interactive: model selection ──
     const items = flat.map((m) => ({
@@ -410,7 +447,7 @@ async function main() {
       id: m.id,
     }));
 
-    const chosen = await multiSelect(items, "Select models to change output limit", "Skip this step (just press enter) to only patch effort levels");
+    const chosen = await multiSelect(items, "Select models to change output limit", "Skip this step (just press enter) to only patch effort/fast mode");
     selectedModels = chosen.map((c) => c.id);
 
     // ── Token limit ──
@@ -434,12 +471,26 @@ async function main() {
       if (needsChooser) parts.push("add to effort chooser");
       doEffort = await confirm(`${bold("Unlock max effort?")} ${dim("(" + parts.join(", ") + ")")}`);
     }
+
+    // ── Fast mode ──
+    if (fastFullyPatched) {
+      info("Fast mode already fully unlocked.");
+    } else if (!fastNeedsAny) {
+      info("Fast mode gates not found (may already be patched or version changed).");
+    } else {
+      console.log();
+      const parts = [];
+      if (needsFastNative) parts.push("bypass native binary check");
+      if (needsFastOrg) parts.push("bypass org preference gate");
+      doFastMode = await confirm(`${bold("Unlock fast mode?")} ${dim("(" + parts.join(", ") + ")")}`);
+    }
   }
 
   // ── Nothing to do? ──
   const modelChange = selectedModels.length > 0 && newLimit > 0;
   const effortChange = doEffort;
-  if (!modelChange && !effortChange) {
+  const fastModeChange = doFastMode;
+  if (!modelChange && !effortChange && !fastModeChange) {
     console.log();
     warn("No changes selected.\n");
     return;
@@ -464,6 +515,12 @@ async function main() {
       console.log(` ${bold("│")}  ${"effort slider/bar".padEnd(22)} ${red("3 levels")} → ${green(bold("4 levels (+max)"))}`);
     if (needsChooser)
       console.log(` ${bold("│")}  ${"effort chooser".padEnd(22)} ${red("no max")} → ${green(bold("max added"))}`);
+  }
+  if (fastModeChange) {
+    if (needsFastNative)
+      console.log(` ${bold("│")}  ${"fast: native check".padEnd(22)} ${red("blocked")} → ${green(bold("bypassed"))}`);
+    if (needsFastOrg)
+      console.log(` ${bold("│")}  ${"fast: org gate".padEnd(22)} ${red("blocked")} → ${green(bold("bypassed"))}`);
   }
   console.log(` ${bold("└" + "─".repeat(42) + "┘")}`);
   console.log();
@@ -490,6 +547,11 @@ async function main() {
     if (needsGate) out = patchEffortGate(out);
     if (needsLevels) out = patchEffortLevels(out);
     if (needsChooser) out = patchEffortChooser(out);
+  }
+
+  if (fastModeChange) {
+    if (needsFastNative) out = patchFastModeNative(out);
+    if (needsFastOrg) out = patchFastModeOrg(out);
   }
 
   writeSafe(cliPath, out);
@@ -542,11 +604,28 @@ async function main() {
     }
   }
 
+  if (fastModeChange) {
+    if (needsFastNative) {
+      total++;
+      if (newState.fastModeNative.unlocked) {
+        showSnip(green("✓"), final, /&&false\)return"Fast mode requires the native binary/, bgGreen);
+        pass++;
+      } else console.log(`   ${red("✗")} fast mode native binary check`);
+    }
+    if (needsFastOrg) {
+      total++;
+      if (newState.fastModeOrg.unlocked) {
+        showSnip(green("✓"), final, /if\(false\)\{let \w+=\w+\(\)!==null\?"oauth"/, bgGreen);
+        pass++;
+      } else console.log(`   ${red("✗")} fast mode org preference gate`);
+    }
+  }
+
   console.log();
 
   if (pass === total) {
     console.log(` ${green(bold(`All ${pass} patch${pass === 1 ? "" : "es"} verified.`))}`);
-    console.log(` ${dim("Re-run after updates. --undo to restore. --auto for effort-only.")}\n`);
+    console.log(` ${dim("Re-run after updates. --undo to restore. --auto for effort + fast mode.")}\n`);
   } else {
     die(`${pass}/${total} verified. Restore: node ${process.argv[1]} --undo`);
   }
